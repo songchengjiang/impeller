@@ -1,0 +1,4 @@
+/build*/
+/.deps/
+/benchmarks/canvasmark/results-*/
+.DS_Store

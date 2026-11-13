@@ -1,0 +1,107 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 05c98d2..55a129b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -11,6 +11,7 @@ set(SKIA_SOURCE "" CACHE PATH "Skia source root")
+ set(SKIA_LIBRARY "${SKIA_SOURCE}/out/CanvasMark/libskia.a" CACHE FILEPATH "Matching Skia Metal library")
+ set(IMPELLER_SOURCE "" CACHE PATH "Local Flutter checkout with CanvasMark Metal interop patch")
+ set(IMPELLER_LIBRARY "" CACHE FILEPATH "Matching patched Flutter libimpeller.dylib")
++set(IMPELLER2D_SDK "" CACHE PATH "Installed standalone Impeller2D C++ SDK")
+ enable_testing()
+ find_package(Python3 COMPONENTS Interpreter QUIET)
+ if(Python3_Interpreter_FOUND)
+@@ -159,7 +160,14 @@ if(EXISTS "${SKIA_GRAPHITE_LIBRARY}" AND "skia_graphite" IN_LIST CM_BACKENDS)
+   target_compile_definitions(canvasmark_graphite_window_diagnostic PRIVATE CM_GRAPHITE CM_WINDOW_DIAGNOSTIC SK_METAL SK_GRAPHITE)
+   target_link_libraries(canvasmark_graphite_window_diagnostic PRIVATE ${SKIA_GRAPHITE_LIBRARY} "-framework CoreGraphics" "-framework CoreText" "-framework Carbon")
+ endif()
+-if(IMPELLER_SOURCE AND IMPELLER_LIBRARY AND "impeller" IN_LIST CM_BACKENDS)
++if(IMPELLER2D_SDK AND "impeller" IN_LIST CM_BACKENDS)
++  find_package(Impeller2D CONFIG REQUIRED PATHS "${IMPELLER2D_SDK}" NO_DEFAULT_PATH)
++  native_target(canvasmark_impeller impeller2d)
++  target_link_libraries(canvasmark_impeller PRIVATE Impeller2D::impeller2d)
++  set_target_properties(canvasmark_impeller PROPERTIES
++    CXX_STANDARD 20 CXX_STANDARD_REQUIRED YES
++    OBJCXX_STANDARD 20 OBJCXX_STANDARD_REQUIRED YES)
++elseif(IMPELLER_SOURCE AND IMPELLER_LIBRARY AND "impeller" IN_LIST CM_BACKENDS)
+   # Flutter's SDK uses ./libimpeller.dylib; stage a relocatable, ad-hoc signed copy.
+   set(impeller_staged "${CMAKE_BINARY_DIR}/impeller/libimpeller.dylib")
+   add_custom_command(OUTPUT "${impeller_staged}"
+diff --git a/src/platform/macos/presentation.h b/src/platform/macos/presentation.h
+index b325411..dab360b 100644
+--- a/src/platform/macos/presentation.h
++++ b/src/platform/macos/presentation.h
+@@ -55,7 +55,20 @@ struct Presentation {
+     [NSApplication sharedApplication];
+     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+     [NSApp finishLaunching];
+-    screen=[NSScreen mainScreen]; require(screen!=nil,"no screen available");
++    NSString* screen_name = NSProcessInfo.processInfo.environment[@"CANVASMARK_SCREEN_NAME"];
++    screen = nil;
++    if (screen_name.length) {
++      for (NSScreen* candidate in NSScreen.screens) {
++        if ([candidate.localizedName isEqualToString:screen_name]) {
++          require(screen == nil, "multiple screens match CANVASMARK_SCREEN_NAME");
++          screen = candidate;
++        }
++      }
++      require(screen != nil, "no screen matches CANVASMARK_SCREEN_NAME");
++    } else {
++      screen = NSScreen.mainScreen;
++      require(screen != nil, "no screen available");
++    }
+     scale=screen.backingScaleFactor;
+     require(target<=screen.maximumFramesPerSecond*1.02,"target FPS exceeds display capability");
+     window=[[NSWindow alloc] initWithContentRect:NSMakeRect(0,0,cm::width/scale,cm::height/scale)
+@@ -75,7 +88,15 @@ struct Presentation {
+     layer.colorspace=color; CGColorSpaceRelease(color);
+ 
+     layer.frame=window.contentView.bounds; layer.drawableSize=CGSizeMake(cm::width,cm::height);
+-    [window center]; [window makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES];
++    if (screen_name.length) {
++      const NSRect visible = screen.visibleFrame;
++      const NSRect frame = window.frame;
++      [window setFrameOrigin:NSMakePoint(NSMidX(visible) - NSWidth(frame) / 2,
++                                        NSMidY(visible) - NSHeight(frame) / 2)];
++    } else {
++      [window center];
++    }
++    [window makeKeyAndOrderFront:nil]; [NSApp activateIgnoringOtherApps:YES];
+     [window display]; [CATransaction flush];
+     auto ready=Clock::now()+std::chrono::seconds(3);
+     do {
+diff --git a/tools/suite.py b/tools/suite.py
+index fc47791..bbfcd2b 100644
+--- a/tools/suite.py
++++ b/tools/suite.py
+@@ -48,6 +48,20 @@ def resource_hashes():
+ def metadata(build, engine):
+     build = resolve_build(build, engine)
+     cache = read_cache(build)
++    if engine == 'impeller' and cache.get('IMPELLER2D_SDK'):
++        sdk = Path(cache['IMPELLER2D_SDK'])
++        lib = (sdk/'lib/libimpeller2d.dylib').resolve(strict=True)
++        headers = sorted((sdk/'include/impeller2d').glob('*.hpp'))
++        if not headers:
++            raise ValueError('standalone Impeller2D SDK has no C++ headers')
++        return {'source': {'sdk': str(sdk), 'library': str(lib),
++                           'headers_sha256': {h.name: sha(h) for h in headers}},
++                'adapter_sha256': sha(ROOT/'src/backends/impeller2d_metal.mm'),
++                'library_sha256': sha(lib),
++                'executable_sha256': sha(build/('canvasmark_'+engine)),
++                'build_type': cache['CMAKE_BUILD_TYPE'], 'cmake_cache': cache,
++                'compiler': command(['xcrun','clang','--version']),
++                'provenance': 'standalone-impeller2d-cpp-sdk'}
+     if engine == 'impeller':
+         library = Path(cache['IMPELLER_LIBRARY'])
+         built = verified_library_identity(build, Path(cache['IMPELLER_SOURCE']), library, engine)
+@@ -244,6 +258,10 @@ def run(args):
+                     if data['render_width']!=WIDTH or data['render_height']!=HEIGHT:raise ValueError('executable render size mismatch')
+                     if data['presentation']['max_drawables']!=profile['max_drawables']:raise ValueError('executable drawable count mismatch; rebuild')
+                     current={k:data[k] for k in ('device','registry_id','os','platform','presentation')}
++                    requested_screen = os.environ.get('CANVASMARK_SCREEN_NAME')
++                    if requested_screen:
++                        require_equal(data['presentation']['name'], requested_screen,
++                                      'window ran on a different display')
+                     sampling=data['sample_positions']
+                     if engine in report['sampling_by_engine']:
+                         require_equal(report['sampling_by_engine'][engine],sampling,'sample positions changed within backend')

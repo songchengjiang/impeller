@@ -1,0 +1,20 @@
+diff --git a/src/backends/skity_metal.mm b/src/backends/skity_metal.mm
+index 2f1f45b..26af92b 100644
+--- a/src/backends/skity_metal.mm
++++ b/src/backends/skity_metal.mm
+@@ -14,6 +14,7 @@ class SkityBackend final : public ObservedMetalBackend {
+   explicit SkityBackend(const cm::BackendOptions& o):ObservedMetalBackend(o) {}
+   void Prepare(id<MTLTexture> texture) override {
+   context=skity::MTLContextCreate(device,(id<MTLCommandQueue>)observed); require(bool(context),"Skity context failed");
++  context->SetEnableSimpleShapePipeline(true);
+    desc.backend=skity::GPUBackendType::kMetal;
+   desc.width=cm::width; desc.height=cm::height; desc.sample_count=options.samples; desc.content_scale=1;
+   desc.surface_type=skity::MTLSurfaceType::kTexture; desc.texture=texture;
+@@ -68,6 +69,7 @@ class SkityBackend final : public ObservedMetalBackend {
+   }
+   NSDictionary* Metadata() const override {
+     NSMutableDictionary* result=[@{@"fonts":resources->fonts,@"glyph_input":resources->glyph_input,
++      @"simple_shape_pipeline":@(context->IsEnableSimpleShapePipeline()),
+       @"surface_cache":@{@"enabled":@NO,@"capacity":@0,@"hits":@0,@"misses":@(surface_misses)}} mutableCopy];
+     return result;
+   }
